@@ -18,6 +18,8 @@ from openai.types.chat import ChatCompletionChunk
 # Import context manager for adding attributes
 from openinference.instrumentation import using_attributes
 
+log = logging.getLogger(__name__)
+
 # --- Import Phoenix Client ---
 try:
     from phoenix.client import Client as PhoenixClient
@@ -33,7 +35,7 @@ except ImportError:
     logging.getLogger(__name__).warning("arize-phoenix-client not installed. Dynamic prompt endpoint will not work.")
 # --------------------------
 
-log = logging.getLogger(__name__)
+# log = logging.getLogger(__name__) # Original position - REMOVED
 router = APIRouter()
 
 # OPENAI_API_BASE_URL = "https://api.openai.com/v1" # SDK handles base URL
