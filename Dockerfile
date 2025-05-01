@@ -14,10 +14,13 @@ RUN pip install poetry==1.8.0
 # Copy only requirements to cache them
 COPY pyproject.toml poetry.lock* ./
 
+# Configure Poetry to create the virtual env in the project directory
+RUN poetry config virtualenvs.in-project true
+
 # Install dependencies
 # --no-root: Don't install the project itself, only dependencies
-# --no-dev: Exclude development dependencies
-RUN poetry install --no-root --no-dev --no-interaction --no-ansi
+# Use --only main instead of deprecated --no-dev
+RUN poetry install --no-root --only main --no-interaction --no-ansi
 
 # --- Final Stage ---
 FROM python:3.11-slim
