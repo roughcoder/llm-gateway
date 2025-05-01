@@ -41,6 +41,6 @@ USER appuser
 EXPOSE 8000
 
 # Command to run the application using python -m
-# Ensure PYTHONPATH includes the src directory if needed, though uvicorn usually handles it
-ENV PYTHONPATH=/app
+# Set PYTHONPATH to include the directory containing the package
+ENV PYTHONPATH=/app/src
 CMD ["python", "-m", "uvicorn", "llm_gateway.main:app", "--host", "0.0.0.0", "--port", "8000"] 
