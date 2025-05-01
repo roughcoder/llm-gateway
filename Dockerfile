@@ -29,7 +29,6 @@ WORKDIR /app
 
 # Copy installed dependencies from builder stage
 COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
-COPY --from=builder /app/.venv/bin /usr/local/bin
 
 # Copy application code
 COPY src/ /app/src/
@@ -41,5 +40,7 @@ USER appuser
 # Expose port 8000
 EXPOSE 8000
 
-# Command to run the application
-CMD ["uvicorn", "llm_gateway.main:app", "--host", "0.0.0.0", "--port", "8000"] 
+# Command to run the application using python -m
+# Ensure PYTHONPATH includes the src directory if needed, though uvicorn usually handles it
+ENV PYTHONPATH=/app
+CMD ["python", "-m", "uvicorn", "llm_gateway.main:app", "--host", "0.0.0.0", "--port", "8000"] 
