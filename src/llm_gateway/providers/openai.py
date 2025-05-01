@@ -7,6 +7,9 @@ from fastapi.responses import StreamingResponse
 from typing import Any, Dict, AsyncGenerator, List, Optional
 from pydantic import BaseModel, Field
 
+# Import OTel trace API needed for get_current_span
+from opentelemetry import trace
+
 # Import OpenAI SDK
 import openai
 from openai import AsyncOpenAI
@@ -101,7 +104,8 @@ async def proxy_openai_chat_completions_sdk(
          raise HTTPException(status_code=500, detail="OpenAI client is not available")
 
     # Extract context attributes for tracing
-    trace_attributes = {
+    # Define base attributes first
+    base_trace_attributes = {
         "session_id": payload.session_id,
         "user_id": payload.user_id,
         "metadata": payload.metadata,
@@ -110,21 +114,20 @@ async def proxy_openai_chat_completions_sdk(
         "prompt_template_version": payload.prompt_template_version,
         "prompt_template_variables": payload.prompt_template_variables,
     }
-    # Filter out None values from trace attributes
-    filtered_trace_attributes = {k: v for k, v in trace_attributes.items() if v is not None}
+    # Filter out None values 
+    filtered_trace_attributes = {k: v for k, v in base_trace_attributes.items() if v is not None}
 
-    # Prepare payload for OpenAI SDK (exclude our custom context fields)
-    sdk_payload_dict = payload.model_dump(exclude_unset=True, exclude=set(trace_attributes.keys()))
+    # Prepare payload for OpenAI SDK (exclude ALL base custom context fields)
+    sdk_payload_dict = payload.model_dump(exclude_unset=True, exclude=set(base_trace_attributes.keys()))
 
     is_streaming_requested = sdk_payload_dict.get("stream", False)
-
-    # --- Manual Span Creation ---
 
     try:
         # --- Revert to simple SDK call wrapped with using_attributes ---
         log.debug("Calling OpenAI SDK chat.completions.create", payload=sdk_payload_dict)
+        # Revert to unpacking with **
         with using_attributes(**filtered_trace_attributes):
-             response = await client.chat.completions.create(**sdk_payload_dict)
+            response = await client.chat.completions.create(**sdk_payload_dict)
         # Auto-instrumentation should handle span creation if enabled
 
         # --- Process and return response (Streaming/Non-streaming) ---
