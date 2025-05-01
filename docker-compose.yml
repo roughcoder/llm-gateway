@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: uvicorn llm_gateway.main:app --reload --host 0.0.0.0 --port 8000
+    volumes:
+      - ./src:/app/src
+    ports:
+      - "8000:8000"
+    environment:
+      # Example Environment Variables - Load secrets securely in production
+      - PYTHONUNBUFFERED=1
+      - PYTHONDONTWRITEBYTECODE=1
+      # - VALID_API_KEYS=testkey1,testkey2
+      # - OPENAI_API_KEY=your_openai_api_key # Add your OpenAI key here
+      # - PHOENIX_API_KEY=your_phoenix_api_key
+      # - PHOENIX_COLLECTOR_ENDPOINT=http://localhost:4317 # Example if running Phoenix collector locally
+    # env_file:
+    #   - .env # Uncomment to load from a .env file 

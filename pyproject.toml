@@ -1,0 +1,24 @@
+[tool.poetry]
+name = "llm-gateway"
+version = "0.1.0"
+description = "API Gateway for LLMs with streaming and observability"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+packages = [{include = "llm_gateway", from = "src"}]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+fastapi = "^0.115.12"
+uvicorn = {extras = ["standard"], version = "^0.34.2"}
+python-dotenv = "^1.1.0"
+httpx = "^0.28.1"
+arize-phoenix = {extras = ["opentelemetry"], version = "^8.30.0"}
+opentelemetry-instrumentation-fastapi = "^0.53b1"
+opentelemetry-instrumentation-httpx = "^0.53b1"
+openai = "^1.76.2"
+structlog = "^25.3.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api" 
