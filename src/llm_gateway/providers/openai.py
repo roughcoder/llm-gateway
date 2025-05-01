@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 import socket
 import time # Import time for potential delays if needed, though not used in check
 from urllib.parse import urlparse # Import urlparse
+import urllib.request
 
 # Import OTel trace API needed for get_current_span
 from opentelemetry import trace
@@ -108,6 +109,45 @@ for url_str in urls_to_check:
 log.info(f"--- Finished Explicit Network Reachability Test. Overall Result: {'ALL PASSED (network-wise)' if all_passed else 'SOME CHECKS FAILED'} ---")
 # NOTE: This test runs synchronously. The code proceeds below only after all checks complete.
 # You can add 'raise ConnectionError("Network checks failed")' here if you want to halt startup on failure.
+
+# --- Explicit API Request Test (Temporary Diagnostic) ---
+log.info("--- Starting Explicit API Request Test (Temporary Diagnostic) ---")
+test_url = 'http://phoenix.infinitestack.io:6006/v1/prompts/system-writer/tags/production'
+test_headers = {
+    'accept': 'application/json',
+    'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJBcGlLZXk6MyJ9.r0w53eXJj8DGbTnFPICD0BE0nLwc_CI1IHBK1TAV4mk' # NOTE: Hardcoding tokens is generally discouraged
+}
+
+try:
+    log.info(f"Making blocking GET request to: {test_url}")
+    req = urllib.request.Request(test_url, headers=test_headers, method='GET')
+    with urllib.request.urlopen(req, timeout=15) as response: # Add timeout
+        status_code = response.getcode()
+        raw_response_body = response.read()
+        log.info(f"API Request SUCCESS: Status Code = {status_code}")
+        try:
+            # Decode assuming UTF-8, replace errors if needed
+            decoded_body = raw_response_body.decode('utf-8', errors='replace') 
+            log.info(f"API Request Response Body:\n{decoded_body}")
+        except Exception as decode_err:
+            log.error(f"Failed to decode response body: {decode_err}")
+            log.info(f"Raw response body (bytes): {raw_response_body}")
+            
+except urllib.error.HTTPError as e:
+    log.error(f"API Request FAILED: HTTP Error Code: {e.code} - {e.reason}")
+    try:
+        # Try reading error response body
+        error_body = e.read().decode('utf-8', errors='replace')
+        log.error(f"Error response body:\n{error_body}")
+    except Exception:
+        log.error("Could not read error response body.")
+except urllib.error.URLError as e:
+    # Handles connection errors, timeouts, DNS errors
+    log.error(f"API Request FAILED: URL Error: {e.reason}")
+except Exception as e:
+    log.error(f"API Request FAILED: Unexpected error: {e}", exc_info=True) # Log traceback for unexpected errors
+
+log.info("--- Finished Explicit API Request Test ---")
 
 # --- Original Phoenix Client Initialization Logic --- 
 # (This section should ideally use PHOENIX_BASE_URL env var as implemented previously, 
