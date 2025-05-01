@@ -1,0 +1,143 @@
+{
+    "clientName": "Thunder Client",
+    "collectionName": "development",
+    "collectionId": "134e7744-6b60-4b22-9a84-2b7bb16a9025",
+    "dateExported": "2025-05-01T11:09:18.646Z",
+    "version": "1.2",
+    "folders": [],
+    "requests": [
+        {
+            "_id": "5a56b0d5-a4e9-4a04-8cd5-669d826c7069",
+            "colId": "134e7744-6b60-4b22-9a84-2b7bb16a9025",
+            "containerId": "",
+            "name": "Health Check",
+            "url": "{{baseURL}}/health",
+            "method": "GET",
+            "sortNum": 30000,
+            "created": "2025-05-01T10:01:38.674Z",
+            "modified": "2025-05-01T10:01:51.367Z",
+            "headers": []
+        },
+        {
+            "_id": "785840d8-9081-461b-a300-14177cbb8b77",
+            "colId": "134e7744-6b60-4b22-9a84-2b7bb16a9025",
+            "containerId": "",
+            "name": "Secure Route",
+            "url": "{{baseURL}}/secure",
+            "method": "GET",
+            "sortNum": 40000,
+            "created": "2025-05-01T10:02:20.594Z",
+            "modified": "2025-05-01T10:03:02.495Z",
+            "headers": [
+                {
+                    "name": "X-API-Key",
+                    "value": "{{apiKey}}"
+                }
+            ]
+        },
+        {
+            "_id": "a1895bcb-2a90-4e76-8354-d2d3400b4ca0",
+            "colId": "134e7744-6b60-4b22-9a84-2b7bb16a9025",
+            "containerId": "",
+            "name": "openai - chat",
+            "url": "{{baseURL}}/providers/openai/chat/completions",
+            "method": "POST",
+            "sortNum": 50000,
+            "created": "2025-05-01T10:08:43.830Z",
+            "modified": "2025-05-01T10:19:18.358Z",
+            "headers": [
+                {
+                    "name": "X-API-Key",
+                    "value": "{{apiKey}}"
+                }
+            ],
+            "body": {
+                "type": "json",
+                "raw": "{\n  \"model\": \"gpt-3.5-turbo\",\n  \"stream\": false,\n  \"messages\": [\n      {\"role\": \"user\", \"content\": \"Hello!\"}\n  ]\n}",
+                "form": []
+            }
+        },
+        {
+            "_id": "4a7f16af-8547-4bea-8837-0c383a0977c0",
+            "colId": "134e7744-6b60-4b22-9a84-2b7bb16a9025",
+            "containerId": "",
+            "name": "Chat Completions (No Stream)",
+            "url": "{{baseURL}}/providers/openai/chat/completions",
+            "method": "POST",
+            "sortNum": 60000,
+            "created": "2025-05-01T10:54:26.328Z",
+            "modified": "2025-05-01T10:57:01.198Z",
+            "headers": [
+                {
+                    "name": "X-API-Key",
+                    "value": "{{apiKey}}"
+                }
+            ],
+            "body": {
+                "type": "json",
+                "raw": "{\n  \"model\": \"gpt-3.5-turbo\",\n  \"stream\": false,\n  \"messages\": [\n      {\"role\": \"user\", \"content\": \"Hello!\"}\n  ]\n}",
+                "form": []
+            }
+        },
+        {
+            "_id": "fddae538-0987-4a5d-a119-e63109058a17",
+            "colId": "134e7744-6b60-4b22-9a84-2b7bb16a9025",
+            "containerId": "",
+            "name": "Chat Completions (Raw Stream)",
+            "url": "{{baseURL}}/providers/openai/chat/completions?stream_format=raw",
+            "method": "POST",
+            "sortNum": 70000,
+            "created": "2025-05-01T10:55:34.581Z",
+            "modified": "2025-05-01T10:57:03.060Z",
+            "headers": [
+                {
+                    "name": "X-API-Key",
+                    "value": "{{apiKey}}"
+                }
+            ],
+            "params": [
+                {
+                    "name": "stream_format",
+                    "value": "raw",
+                    "isPath": false
+                }
+            ],
+            "body": {
+                "type": "json",
+                "raw": "{\n  \"model\": \"gpt-3.5-turbo\",\n  \"stream\": true,\n  \"messages\": [\n      {\"role\": \"user\", \"content\": \"Hello!\"}\n  ]\n}",
+                "form": []
+            }
+        },
+        {
+            "_id": "fb4d8c35-a06c-4f88-8a47-dc52ae00cb44",
+            "colId": "134e7744-6b60-4b22-9a84-2b7bb16a9025",
+            "containerId": "",
+            "name": "Chat Completions (SSE Stream)",
+            "url": "{{baseURL}}/providers/openai/chat/completions?stream_format=sse",
+            "method": "POST",
+            "sortNum": 90000,
+            "created": "2025-05-01T11:01:14.185Z",
+            "modified": "2025-05-01T11:01:14.185Z",
+            "headers": [
+                {
+                    "name": "X-API-Key",
+                    "value": "{{apiKey}}"
+                }
+            ],
+            "params": [
+                {
+                    "name": "stream_format",
+                    "value": "sse",
+                    "isPath": false
+                }
+            ],
+            "body": {
+                "type": "json",
+                "raw": "{\n  \"model\": \"gpt-3.5-turbo\",\n  \"stream\": true,\n  \"messages\": [\n      {\"role\": \"user\", \"content\": \"Hello!\"}\n  ]\n}",
+                "form": []
+            },
+            "reqType": "sse"
+        }
+    ],
+    "ref": "RfbhaSSTjEfqQG2tWD56KdOmeoaneeGeqHL7jF9wQolIV8C0OIBWFoZt-DiXY60wn-4lzPl-iJQYKFEpMId09w"
+}

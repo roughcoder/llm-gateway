@@ -1,0 +1,18 @@
+{
+    "clientName": "Thunder Client",
+    "environmentName": "development",
+    "environmentId": "09557f92-7145-45a2-8556-6aac128d99b2",
+    "dateExported": "2025-05-01T10:00:06.697Z",
+    "version": "1.2",
+    "variables": [
+        {
+            "name": "baseURL",
+            "value": "http://localhost:8000"
+        },
+        {
+            "name": "apiKey",
+            "value": "YOUR_API_KEY_HERE"
+        }
+    ],
+    "ref": "DEZXovu7K7o6RYjHuTI0hv-Os8Iy_A7hyz-3YBwnbxeGTiMlxorj6uLjEaHsN_ZT"
+}
