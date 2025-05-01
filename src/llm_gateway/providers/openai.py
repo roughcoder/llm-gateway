@@ -6,6 +6,8 @@ from fastapi import APIRouter, HTTPException, Request, Response, Query
 from fastapi.responses import StreamingResponse
 from typing import Any, Dict, AsyncGenerator, List, Optional, Union
 from pydantic import BaseModel, Field
+import socket
+import time # Import time for potential delays if needed, though not used in check
 
 # Import OTel trace API needed for get_current_span
 from opentelemetry import trace
@@ -19,6 +21,43 @@ from openai.types.chat import ChatCompletionChunk
 from openinference.instrumentation import using_attributes
 
 log = logging.getLogger(__name__)
+
+# --- Helper function for domain check ---
+def check_domain_reachability(domain: str, port: int = 80, timeout: int = 5) -> bool:
+    """Attempts a socket connection to check if a domain is reachable."""
+    try:
+        start_time = time.monotonic()
+        log.debug(f"Checking reachability of {domain}:{port} with timeout {timeout}s")
+        # Resolve hostname first (optional, but can give clearer DNS errors)
+        # ip_address = socket.gethostbyname(domain)
+        # log.debug(f"Resolved {domain} to {ip_address}")
+        
+        # Attempt connection
+        sock = socket.create_connection((domain, port), timeout=timeout)
+        sock.close()
+        end_time = time.monotonic()
+        log.debug(f"Successfully connected to {domain}:{port} in {end_time - start_time:.2f}s")
+        return True
+    except socket.timeout:
+        log.warning(f"Timeout ({timeout}s) trying to connect to {domain}:{port}")
+        return False
+    except socket.gaierror:
+        log.warning(f"DNS resolution failed for {domain}")
+        return False
+    except socket.error as e:
+        log.warning(f"Could not connect to {domain}:{port}. Error: {e}")
+        return False
+    except Exception as e:
+        log.error(f"Unexpected error checking reachability for {domain}:{port}: {e}")
+        return False
+
+# --- Perform Reachability Checks ---
+domains_to_check = ["https://phoenix.infinitestack.io", "http://phoenix.infinitestack.io", "http://phoenix.infinitestack.io:8000", , "http://phoenix.infinitestack.io:6006"] # Use the list provided by user
+log.info("Performing preliminary domain reachability checks...")
+for domain in domains_to_check:
+    is_reachable = check_domain_reachability(domain)
+    log.info(f"Reachability check for {domain}: {'REACHABLE' if is_reachable else 'UNREACHABLE'}")
+log.info("Finished preliminary domain reachability checks.")
 
 # --- Import Phoenix Client ---
 try:
