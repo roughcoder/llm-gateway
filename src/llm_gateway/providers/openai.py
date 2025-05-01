@@ -8,6 +8,7 @@ from typing import Any, Dict, AsyncGenerator, List, Optional, Union
 from pydantic import BaseModel, Field
 import socket
 import time # Import time for potential delays if needed, though not used in check
+from urllib.parse import urlparse # Import urlparse
 
 # Import OTel trace API needed for get_current_span
 from opentelemetry import trace
@@ -23,55 +24,94 @@ from openinference.instrumentation import using_attributes
 log = logging.getLogger(__name__)
 
 # --- Helper function for domain check ---
-def check_domain_reachability(domain: str, port: int = 80, timeout: int = 5) -> bool:
-    """Attempts a socket connection to check if a domain is reachable."""
+def check_domain_reachability(domain: str, port: int, timeout: int = 5) -> bool:
+    """Attempts a socket connection to check if a hostname/IP is reachable on a specific port."""
     try:
         start_time = time.monotonic()
         log.debug(f"Checking reachability of {domain}:{port} with timeout {timeout}s")
-        # Resolve hostname first (optional, but can give clearer DNS errors)
-        # ip_address = socket.gethostbyname(domain)
-        # log.debug(f"Resolved {domain} to {ip_address}")
-        
         # Attempt connection
         sock = socket.create_connection((domain, port), timeout=timeout)
         sock.close()
         end_time = time.monotonic()
-        log.debug(f"Successfully connected to {domain}:{port} in {end_time - start_time:.2f}s")
+        # Log success clearly for the explicit check
+        log.info(f"SUCCESS: Connection established to {domain}:{port} in {end_time - start_time:.2f}s")
         return True
     except socket.timeout:
-        log.warning(f"Timeout ({timeout}s) trying to connect to {domain}:{port}")
+        log.warning(f"FAILURE: Timeout ({timeout}s) trying to connect to {domain}:{port}")
         return False
     except socket.gaierror:
-        log.warning(f"DNS resolution failed for {domain}")
+        log.warning(f"FAILURE: DNS resolution failed for hostname {domain}")
         return False
     except socket.error as e:
-        log.warning(f"Could not connect to {domain}:{port}. Error: {e}")
+        log.warning(f"FAILURE: Could not connect to {domain}:{port}. Error: {e}")
         return False
     except Exception as e:
-        log.error(f"Unexpected error checking reachability for {domain}:{port}: {e}")
+        log.error(f"FAILURE: Unexpected error checking reachability for {domain}:{port}: {e}")
         return False
 
-# --- Perform Reachability Checks ---
-domains_to_check = ["https://phoenix.infinitestack.io", "http://phoenix.infinitestack.io", "http://phoenix.infinitestack.io:8000", , "http://phoenix.infinitestack.io:6006"] # Use the list provided by user
-log.info("Performing preliminary domain reachability checks...")
-for domain in domains_to_check:
-    is_reachable = check_domain_reachability(domain)
-    log.info(f"Reachability check for {domain}: {'REACHABLE' if is_reachable else 'UNREACHABLE'}")
-log.info("Finished preliminary domain reachability checks.")
+# --- Explicit Network Reachability Test (Temporary Diagnostic) ---
+# Corrected list provided by user
+urls_to_check = [
+    "https://phoenix.infinitestack.io", 
+    "http://phoenix.infinitestack.io", 
+    "http://phoenix.infinitestack.io:8000", 
+    "http://phoenix.infinitestack.io:6006"
+]
+log.info("--- Starting Explicit Network Reachability Test (Temporary Diagnostic) ---")
+all_passed = True
+for url_str in urls_to_check:
+    log.info(f"Testing URL: {url_str}")
+    try:
+        parsed_url = urlparse(url_str)
+        hostname = parsed_url.hostname
+        port = parsed_url.port
+        # Infer default port if not specified
+        if port is None:
+            if parsed_url.scheme == 'https':
+                port = 443
+            else:
+                port = 80 # Default to HTTP port 80
+        
+        if not hostname:
+            log.warning(f"Could not parse hostname from URL: {url_str}. Skipping check.")
+            all_passed = False # Consider parse failure as a failure
+            continue
 
-# --- Import Phoenix Client ---
+        # Perform the blocking check for the parsed host/port
+        is_reachable = check_domain_reachability(hostname, port)
+        if not is_reachable:
+             all_passed = False # Mark overall test as failed if any check fails
+
+    except ValueError as e:
+        log.error(f"Invalid URL format: {url_str}. Error: {e}")
+        all_passed = False
+    except Exception as e:
+        log.error(f"Unexpected error processing URL {url_str}: {e}")
+        all_passed = False
+    # Add a small delay if desired, e.g., time.sleep(0.1)
+
+log.info(f"--- Finished Explicit Network Reachability Test. Overall Result: {'ALL PASSED (network-wise)' if all_passed else 'SOME CHECKS FAILED'} ---")
+# NOTE: This test runs synchronously. The code proceeds below only after all checks complete.
+# You can add 'raise ConnectionError("Network checks failed")' here if you want to halt startup on failure.
+
+# --- Original Phoenix Client Initialization Logic --- 
+# (This section should ideally use PHOENIX_BASE_URL env var as implemented previously, 
+# but keeping it separate as requested for this temporary test)
+# Read the base URL from environment variable, fallback to default
+phoenix_base_url = os.environ.get("PHOENIX_BASE_URL", "https://phoenix.infinitestack.io")
+log.info(f"Target Phoenix base URL configured as: {phoenix_base_url}")
+
+# --- Import and Initialize Phoenix Client --- 
 try:
     from phoenix.client import Client as PhoenixClient
-    # Initialize Phoenix client
-    # Read the base URL from environment variable, fallback to default
-    phoenix_base_url = os.environ.get("PHOENIX_BASE_URL", "https://phoenix.infinitestack.io")
-    log.info(f"Initializing PhoenixClient with base_url: {phoenix_base_url}") # Add logging
+    # Initialize Phoenix client using the configured URL
+    log.info(f"Initializing PhoenixClient with base_url: {phoenix_base_url}")
     phoenix_client = PhoenixClient(base_url=phoenix_base_url)
     phoenix_available = True
 except ImportError:
     phoenix_client = None
     phoenix_available = False
-    logging.getLogger(__name__).warning("arize-phoenix-client not installed. Dynamic prompt endpoint will not work.")
+    logging.getLogger(__name__).warning("arize-phoenix-client library not installed. Dynamic prompt endpoint will not work.")
 # --------------------------
 
 # log = logging.getLogger(__name__) # Original position - REMOVED
