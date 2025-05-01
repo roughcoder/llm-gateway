@@ -5,6 +5,7 @@ import os
 
 from fastapi import FastAPI, Depends, APIRouter, Request, Response
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import structlog
 
@@ -108,6 +109,17 @@ app = FastAPI(
     description="API Gateway for LLMs with streaming and observability",
     dependencies=[Depends(api_key_header)]
 )
+
+# --- Add CORS Middleware ---
+# TODO: Restrict origins for production environments for security
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"], # Allows all methods
+    allow_headers=["*"], # Allows all headers
+)
+# --- End CORS Middleware ---
 
 # --- OTel FastAPI Instrumentation Moved (or disabled) ---
 # Instrument FastAPI App (if possible and enabled)
