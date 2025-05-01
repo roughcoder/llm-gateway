@@ -23,6 +23,21 @@ from openinference.instrumentation import using_attributes
 
 log = logging.getLogger(__name__)
 
+# --- Log Environment Variables ---
+log.info("--- Dumping Environment Variables (Masking sensitive keywords) ---")
+sensitive_keywords = ["KEY", "SECRET", "PASSWORD", "TOKEN", "CONN_STR"]
+try:
+    # Sort items for consistent logging order
+    for key, value in sorted(os.environ.items()):
+        is_sensitive = any(keyword in key.upper() for keyword in sensitive_keywords)
+        if is_sensitive:
+            log.info(f"ENV: {key}=********")
+        else:
+            log.info(f"ENV: {key}={value}")
+except Exception as e:
+    log.error(f"Error dumping environment variables: {e}")
+log.info("--- Finished Dumping Environment Variables ---")
+
 # --- Helper function for domain check ---
 def check_domain_reachability(domain: str, port: int, timeout: int = 5) -> bool:
     """Attempts a socket connection to check if a hostname/IP is reachable on a specific port."""
