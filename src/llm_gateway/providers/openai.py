@@ -7,9 +7,6 @@ from fastapi.responses import StreamingResponse
 from typing import Any, Dict, AsyncGenerator, List, Optional
 from pydantic import BaseModel, Field
 
-# Import OpenTelemetry trace API (Needed? Auto-instrumentation might handle it)
-# from opentelemetry import trace
-
 # Import OpenAI SDK
 import openai
 from openai import AsyncOpenAI
@@ -23,10 +20,18 @@ router = APIRouter()
 
 # OPENAI_API_BASE_URL = "https://api.openai.com/v1" # SDK handles base URL
 
-# --- Client Management ---
-# REMOVED Global client instance and get_openai_sdk_client function
-# Client will be initialized within the endpoint function to ensure
-# instrumentation is active beforehand.
+# Initialize the client once at the module level.
+# This assumes instrumentation in main.py has already run via import side effects.
+log.info("Initializing module-level OpenAI SDK client")
+try:
+    client = AsyncOpenAI()
+    # SDK automatically uses OPENAI_API_KEY env var
+    log.info("Module-level OpenAI SDK client initialized successfully.")
+except Exception as e:
+    log.exception("Failed to initialize module-level OpenAI SDK client during import")
+    # Raise or handle appropriately - perhaps set client to None and check in endpoint?
+    # For now, let the exception propagate to prevent app startup on critical failure.
+    raise e
 
 # --- Pydantic Models for Request Body ---
 class OpenAIChatMessage(BaseModel):
@@ -90,15 +95,10 @@ async def proxy_openai_chat_completions_sdk(
     stream_format: str | None = Query(None, description="Specify 'sse' for Server-Sent Events when stream=true. Defaults to raw chunk streaming if stream=true.")
 ):
     """Proxy requests to the OpenAI Chat Completions endpoint using the SDK."""
-    # Initialize client here
-    try:
-        log.debug("Initializing OpenAI SDK client within endpoint")
-        client = AsyncOpenAI()
-        # SDK automatically uses OPENAI_API_KEY env var
-    except Exception as e:
-        # Catch potential init errors (though unlikely if key is checked elsewhere)
-        log.exception("Failed to initialize OpenAI SDK client")
-        raise HTTPException(status_code=500, detail="Failed to initialize OpenAI client")
+    # Check if client initialization failed during import
+    if client is None: # Modify this check if you handle the exception differently above
+         log.error("OpenAI client was not initialized.")
+         raise HTTPException(status_code=500, detail="OpenAI client is not available")
 
     # Extract context attributes for tracing
     trace_attributes = {
@@ -118,15 +118,16 @@ async def proxy_openai_chat_completions_sdk(
 
     is_streaming_requested = sdk_payload_dict.get("stream", False)
 
+    # --- Manual Span Creation ---
+
     try:
+        # --- Revert to simple SDK call wrapped with using_attributes ---
         log.debug("Calling OpenAI SDK chat.completions.create", payload=sdk_payload_dict)
-        
-        # Wrap the SDK call with the context manager to add attributes
         with using_attributes(**filtered_trace_attributes):
              response = await client.chat.completions.create(**sdk_payload_dict)
-        
-        # Auto-instrumentation should have wrapped this call and added trace attributes
+        # Auto-instrumentation should handle span creation if enabled
 
+        # --- Process and return response (Streaming/Non-streaming) ---
         if is_streaming_requested:
             # response is an AsyncStream[ChatCompletionChunk]
             if stream_format == "sse":
@@ -155,10 +156,9 @@ async def proxy_openai_chat_completions_sdk(
         else:
             # Non-streaming response: response is ChatCompletion object
             log.info("Returning non-streaming response via SDK")
-            # FastAPI automatically converts Pydantic model to JSON
             return response
 
-    except openai.APIStatusError as e:
+    except openai.APIStatusError as e: # Revert exception handling to simpler form
         log.warning("OpenAI API returned an error", status_code=e.status_code, error=str(e))
         raise HTTPException(status_code=e.status_code, detail=str(e))
     except openai.APIConnectionError as e:
@@ -169,7 +169,6 @@ async def proxy_openai_chat_completions_sdk(
         raise HTTPException(status_code=429, detail=f"OpenAI rate limit exceeded: {e}")
     except openai.AuthenticationError as e:
         log.error(f"OpenAI authentication error: {e}")
-        # This should ideally be caught during client init, but double-check
         raise HTTPException(status_code=401, detail=f"OpenAI authentication error: {e}")
     except Exception as exc:
         log.exception("Unhandled internal server error during OpenAI SDK call")
