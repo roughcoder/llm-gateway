@@ -1,39 +1,32 @@
 import os
-import httpx
+# import httpx # No longer using httpx directly
 import logging
+import json
 from fastapi import APIRouter, HTTPException, Request, Response, Query
 from fastapi.responses import StreamingResponse
 from typing import Any, Dict, AsyncGenerator, List, Optional
 from pydantic import BaseModel, Field
 
-# Note: Using httpx directly for now, but could switch to openai SDK later
-# from openai import AsyncOpenAI
+# Import OpenTelemetry trace API (Needed? Auto-instrumentation might handle it)
+# from opentelemetry import trace
+
+# Import OpenAI SDK
+import openai
+from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletionChunk
+
+# Import context manager for adding attributes
+from openinference.instrumentation import using_attributes
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 
-OPENAI_API_BASE_URL = "https://api.openai.com/v1"
+# OPENAI_API_BASE_URL = "https://api.openai.com/v1" # SDK handles base URL
 
 # --- Client Management ---
-# Global client instance (consider lifespan management for production)
-_async_client: httpx.AsyncClient | None = None
-
-def get_openai_client() -> httpx.AsyncClient:
-    """Get the shared httpx client."""
-    global _async_client
-    if _async_client is None:
-        log.info("Initializing OpenAI HTTPX client")
-        _async_client = httpx.AsyncClient(base_url=OPENAI_API_BASE_URL)
-    return _async_client
-
-# TODO: Add lifespan manager to close the client on shutdown
-# @app.on_event("shutdown")
-# async def shutdown_event():
-#     global _async_client
-#     if _async_client:
-#         await _async_client.aclose()
-#         _async_client = None
-#         log.info("Closed OpenAI HTTPX client")
+# REMOVED Global client instance and get_openai_sdk_client function
+# Client will be initialized within the endpoint function to ensure
+# instrumentation is active beforehand.
 
 # --- Pydantic Models for Request Body ---
 class OpenAIChatMessage(BaseModel):
@@ -41,143 +34,145 @@ class OpenAIChatMessage(BaseModel):
     content: str
 
 class OpenAIChatCompletionRequest(BaseModel):
+    # Core OpenAI fields
     model: str
     messages: List[OpenAIChatMessage]
     stream: Optional[bool] = False
-    # Add other common OpenAI parameters as needed for validation/docs
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
-    # ... other params
+    
+    # --- Context fields for Tracing ---
+    session_id: Optional[str] = Field(None, description="Session ID for grouping related traces.")
+    user_id: Optional[str] = Field(None, description="User ID associated with the request.")
+    metadata: Optional[Dict[str, Any]] = Field(None, description="Arbitrary key-value metadata for the trace.")
+    tags: Optional[List[str]] = Field(None, description="List of tags to add to the trace.")
+    prompt_template: Optional[str] = Field(None, description="The raw prompt template string used (if any).")
+    prompt_template_version: Optional[str] = Field(None, description="Version identifier for the prompt template.")
+    prompt_template_variables: Optional[Dict[str, Any]] = Field(None, description="Dictionary of variables used to fill the prompt template.")
+    # ------------------------------------
 
-    # Allow extra fields to pass through to OpenAI
+    # Allow other fields supported by OpenAI API
     class Config:
         extra = 'allow'
 
 # --- Streaming Generators ---
-async def raw_stream_generator(response: httpx.Response) -> AsyncGenerator[bytes, None]:
-    """Yields raw byte chunks from the upstream response."""
+async def sdk_raw_stream_generator(stream: AsyncGenerator[ChatCompletionChunk, None]) -> AsyncGenerator[bytes, None]:
+    """Yields raw JSON string bytes from the SDK stream chunks."""
     try:
-        async for chunk in response.aiter_bytes():
-            yield chunk
+        async for chunk in stream:
+            # Each chunk is a Pydantic model (ChatCompletionChunk)
+            # Convert it to JSON string and then bytes
+            yield chunk.model_dump_json().encode('utf-8') + b"\n" # Add newline for separation
     except Exception as e:
-        log.error(f"Error during raw stream processing: {e}", exc_info=True)
-    finally:
-        await response.aclose()
+        log.error(f"Error during SDK raw stream processing: {e}", exc_info=True)
 
-async def sse_stream_generator(response: httpx.Response) -> AsyncGenerator[bytes, None]:
-    """Yields SSE formatted events from the upstream response lines."""
+async def sdk_sse_stream_generator(stream: AsyncGenerator[ChatCompletionChunk, None]) -> AsyncGenerator[bytes, None]:
+    """Yields SSE formatted events from the SDK stream chunks."""
     try:
-        async for line in response.aiter_lines():
-            if line:
-                # Format as SSE 'data: ...\n\n'
-                # OpenAI usually sends lines already starting with 'data: ', but we ensure format.
-                if line.startswith("data:"):
-                    yield f"{line}\n\n".encode('utf-8')
-                else:
-                    # If line doesn't start with 'data:', wrap it
-                    yield f"data: {line}\n\n".encode('utf-8')
-            else:
-                # Yield empty lines if needed, or handle specific events like [DONE]
-                yield b'\n' # Send keep-alive or separator if necessary
+        async for chunk in stream:
+            # Convert chunk model to JSON string
+            chunk_json = chunk.model_dump_json()
+            # Format as SSE event
+            sse_event = f"data: {chunk_json}\n\n"
+            yield sse_event.encode('utf-8')
+        # Optionally send a [DONE] message if needed by clients
+        # yield b"data: [DONE]\n\n"
     except Exception as e:
-        log.error(f"Error during SSE stream processing: {e}", exc_info=True)
-    finally:
-        await response.aclose()
+        log.error(f"Error during SDK SSE stream processing: {e}", exc_info=True)
 
 # --- Endpoint ---
 @router.post("/chat/completions",
-            # No response_model defined as we proxy directly
             status_code=200,
-            summary="Proxy OpenAI Chat Completions",
-            description="Proxies requests to the OpenAI /v1/chat/completions endpoint.\n\nSupports standard non-streaming, raw chunk streaming (`stream=True`), and Server-Sent Events (`stream=True`, `stream_format=sse`).")
-async def proxy_openai_chat_completions(
-    payload: OpenAIChatCompletionRequest, # Use Pydantic model here
-    stream_format: str | None = Query(None, description="Specify 'sse' for Server-Sent Events when stream=true. Defaults to raw chunk streaming.")
+            summary="Proxy OpenAI Chat Completions via SDK",
+            description="Proxies requests to OpenAI /v1/chat/completions using the OpenAI SDK.\n\nSupports standard non-streaming, raw chunk streaming (`stream=True`), and Server-Sent Events (`stream=True`, `stream_format=sse`). Tracing is automatically handled by OpenInference instrumentation.")
+async def proxy_openai_chat_completions_sdk(
+    payload: OpenAIChatCompletionRequest,
+    stream_format: str | None = Query(None, description="Specify 'sse' for Server-Sent Events when stream=true. Defaults to raw chunk streaming if stream=true.")
 ):
-    """Proxy requests to the OpenAI Chat Completions endpoint, supporting non-streaming, raw chunk streaming, and SSE."""
-    client = get_openai_client()
-    openai_api_key = os.getenv("OPENAI_API_KEY")
-    if not openai_api_key:
-        log.error("OPENAI_API_KEY not configured")
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
+    """Proxy requests to the OpenAI Chat Completions endpoint using the SDK."""
+    # Initialize client here
+    try:
+        log.debug("Initializing OpenAI SDK client within endpoint")
+        client = AsyncOpenAI()
+        # SDK automatically uses OPENAI_API_KEY env var
+    except Exception as e:
+        # Catch potential init errors (though unlikely if key is checked elsewhere)
+        log.exception("Failed to initialize OpenAI SDK client")
+        raise HTTPException(status_code=500, detail="Failed to initialize OpenAI client")
 
-    # Convert Pydantic model back to dict for sending to OpenAI
-    # Use exclude_unset=True to only send parameters explicitly set by the client
-    request_payload_dict = payload.model_dump(exclude_unset=True)
-
-    headers = {
-        "Authorization": f"Bearer {openai_api_key}",
-        "Content-Type": "application/json",
+    # Extract context attributes for tracing
+    trace_attributes = {
+        "session_id": payload.session_id,
+        "user_id": payload.user_id,
+        "metadata": payload.metadata,
+        "tags": payload.tags,
+        "prompt_template": payload.prompt_template,
+        "prompt_template_version": payload.prompt_template_version,
+        "prompt_template_variables": payload.prompt_template_variables,
     }
+    # Filter out None values from trace attributes
+    filtered_trace_attributes = {k: v for k, v in trace_attributes.items() if v is not None}
 
-    is_streaming_requested = request_payload_dict.get("stream", False)
-    url = f"/chat/completions"
+    # Prepare payload for OpenAI SDK (exclude our custom context fields)
+    sdk_payload_dict = payload.model_dump(exclude_unset=True, exclude=set(trace_attributes.keys()))
+
+    is_streaming_requested = sdk_payload_dict.get("stream", False)
 
     try:
-        upstream_request = client.build_request(
-            method="POST",
-            url=url,
-            json=request_payload_dict, # Send the dict
-            headers=headers
-        )
+        log.debug("Calling OpenAI SDK chat.completions.create", payload=sdk_payload_dict)
+        
+        # Wrap the SDK call with the context manager to add attributes
+        with using_attributes(**filtered_trace_attributes):
+             response = await client.chat.completions.create(**sdk_payload_dict)
+        
+        # Auto-instrumentation should have wrapped this call and added trace attributes
 
-        log.debug("Sending request to OpenAI", url=url, method="POST", stream=is_streaming_requested, payload=request_payload_dict)
-        upstream_response = await client.send(upstream_request, stream=is_streaming_requested)
-        log.debug("Received response from OpenAI", status_code=upstream_response.status_code)
-
-        # Handle potential errors from OpenAI API itself (non-2xx status)
-        if upstream_response.status_code < 200 or upstream_response.status_code >= 300:
-            # Read error body whether streaming or not
-            error_body = await upstream_response.aread()
-            await upstream_response.aclose()
-            log.warning("OpenAI API returned error", status=upstream_response.status_code, detail=error_body.decode())
-            # Forward the exact status and body from OpenAI
-            return Response(
-                content=error_body,
-                status_code=upstream_response.status_code,
-                media_type=upstream_response.headers.get("content-type", "application/json")
-            )
-
-        # Handle successful responses (2xx)
         if is_streaming_requested:
+            # response is an AsyncStream[ChatCompletionChunk]
             if stream_format == "sse":
-                log.info("Streaming response as SSE")
-                # SSE stream
+                log.info("Streaming response as SSE via SDK")
                 response_headers = {
                     "Content-Type": "text/event-stream",
                     "Cache-Control": "no-cache",
                     "X-Accel-Buffering": "no",
                     "Connection": "keep-alive",
                 }
+                # Note: The stream type hint might differ based on openai version
                 return StreamingResponse(
-                    sse_stream_generator(upstream_response),
-                    status_code=200, # Always 200 for successful stream start
+                    sdk_sse_stream_generator(response), # type: ignore
+                    status_code=200,
                     headers=response_headers
                 )
             else:
-                log.info("Streaming response as raw chunks")
-                # Raw chunk stream (default)
+                log.info("Streaming response as raw JSON chunks via SDK")
+                # Raw chunk stream (yield JSON representation of each chunk)
+                # Content-Type might be application/x-ndjson or similar
                 return StreamingResponse(
-                    raw_stream_generator(upstream_response),
+                    sdk_raw_stream_generator(response), # type: ignore
                     status_code=200,
-                    media_type=upstream_response.headers.get("content-type") # Proxy content type
+                    media_type="application/x-ndjson" # Newline-delimited JSON
                 )
         else:
-            # Non-streaming response
-            log.info("Returning non-streaming response")
-            response_data = await upstream_response.aread()
-            await upstream_response.aclose()
-            return Response(
-                content=response_data,
-                status_code=upstream_response.status_code,
-                media_type=upstream_response.headers.get("content-type")
-            )
+            # Non-streaming response: response is ChatCompletion object
+            log.info("Returning non-streaming response via SDK")
+            # FastAPI automatically converts Pydantic model to JSON
+            return response
 
-    except httpx.RequestError as exc:
-        log.error(f"HTTPX RequestError contacting OpenAI: {exc}", exc_info=True)
-        raise HTTPException(status_code=503, detail=f"Error contacting OpenAI service: {exc}")
+    except openai.APIStatusError as e:
+        log.warning("OpenAI API returned an error", status_code=e.status_code, error=str(e))
+        raise HTTPException(status_code=e.status_code, detail=str(e))
+    except openai.APIConnectionError as e:
+        log.error(f"OpenAI SDK failed to connect: {e}", exc_info=True)
+        raise HTTPException(status_code=503, detail=f"Failed to connect to OpenAI service: {e}")
+    except openai.RateLimitError as e:
+        log.warning(f"OpenAI rate limit exceeded: {e}")
+        raise HTTPException(status_code=429, detail=f"OpenAI rate limit exceeded: {e}")
+    except openai.AuthenticationError as e:
+        log.error(f"OpenAI authentication error: {e}")
+        # This should ideally be caught during client init, but double-check
+        raise HTTPException(status_code=401, detail=f"OpenAI authentication error: {e}")
     except Exception as exc:
-        log.exception("Unhandled internal server error during OpenAI proxy") # Catches unexpected errors
+        log.exception("Unhandled internal server error during OpenAI SDK call")
         raise HTTPException(status_code=500, detail=f"Internal server error: {exc}")
 
 # Add other OpenAI endpoints as needed following the same proxy pattern 

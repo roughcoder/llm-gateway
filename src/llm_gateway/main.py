@@ -10,20 +10,95 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 import structlog
 
-# Load .env file before importing other modules that might need env vars
+# --- Early Initialization ---
+
+# Load .env file first
 load_dotenv()
 
-# Configure logging BEFORE other imports that might log
+# Configure Logging
 from .logging_config import setup_logging
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 setup_logging(log_level=LOG_LEVEL)
-
-# Get a logger instance
 log = structlog.get_logger(__name__)
+
+# Configure OpenTelemetry (using Arize Phoenix)
+# Must be done BEFORE instrumenting libraries or importing instrumented libs
+try:
+    import phoenix.otel
+    from opentelemetry import trace # Import trace API
+    from opentelemetry.sdk.trace import TracerProvider # Import TracerProvider
+    from opentelemetry.sdk.trace.export import ConsoleSpanExporter, SimpleSpanProcessor # Import exporter/processor
+
+    # Service name can be set via OTEL_SERVICE_NAME env var
+    # Resource attributes can be set via OTEL_RESOURCE_ATTRIBUTES env var
+    
+    # Configure Phoenix connection details
+    # Explicitly set endpoint and project name if needed,
+    # otherwise defaults and env vars (PHOENIX_PROJECT_NAME, OTEL_EXPORTER_OTLP_ENDPOINT) are used.
+    PHOENIX_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "https://phoenix.infinitestack.io/v1/traces") # Your custom endpoint + OTel path
+    PHOENIX_PROJECT = os.getenv("PHOENIX_PROJECT_NAME", "your-next-llm-project") # Your project name
+
+    log.info("Configuring Phoenix OTel", endpoint=PHOENIX_ENDPOINT, project=PHOENIX_PROJECT)
+
+    # Register Phoenix FIRST
+    phoenix.otel.register(
+        project_name=PHOENIX_PROJECT,
+        endpoint=PHOENIX_ENDPOINT,
+    )
+    log.info("Arize Phoenix OpenTelemetry registered successfully.")
+
+    # --- Explicit Instrumentation (Attempt AFTER OTel setup) ---
+    instrument_fastapi = False # Flag to enable/disable - SET TO FALSE
+    instrument_openai = True  # Flag to enable/disable - KEEP TRUE
+
+    # Instrument OpenAI SDK (if possible and enabled)
+    # Do this EARLY, before potentially importing modules that use the SDK
+    if instrument_openai:
+        log.debug("Attempting to instrument OpenAI SDK...")
+        try:
+            # Get the global tracer provider configured by Phoenix/OTel
+            tracer_provider = trace.get_tracer_provider()
+            # Must import here after OTel is configured
+            from opentelemetry.instrumentation.openai import OpenAIInstrumentor
+            # Explicitly pass the tracer_provider
+            OpenAIInstrumentor().instrument(tracer_provider=tracer_provider)
+            log.info("Explicit OpenAI SDK instrumentation enabled.")
+        except ImportError:
+            log.warning("OpenAIInstrumentor not found, cannot instrument OpenAI SDK.")
+            instrument_openai = False # Disable if import failed
+        except Exception as e:
+            log.exception("Failed to instrument OpenAI SDK")
+            instrument_openai = False # Disable if instrumentation failed
+    else:
+        log.warning("OpenAI SDK instrumentation disabled by flag.")
+
+    # --- Console Exporter (Keep commented out for now) ---
+    # # Get the TracerProvider configured by phoenix.otel.register
+    # tracer_provider = trace.get_tracer_provider()
+    # # Add the console exporter using a SimpleSpanProcessor
+    # # Note: Phoenix likely uses BatchSpanProcessor for OTLP, keep Simple for console.
+    # console_exporter = ConsoleSpanExporter()
+    # tracer_provider.add_span_processor(SimpleSpanProcessor(console_exporter))
+    # log.info("Added ConsoleSpanExporter for OTel debugging.")
+    # ------------------------------------------
+
+    # Set default service name AFTER instrumentation might have been attempted
+    if not os.getenv("OTEL_SERVICE_NAME"):
+        os.environ["OTEL_SERVICE_NAME"] = "llm-gateway"
+
+except ImportError as e:
+    log.warning("Required OpenTelemetry/Phoenix libraries not found. Skipping OTel setup.", error=str(e))
+    instrument_fastapi = False
+    instrument_openai = False # Ensure flags are false if initial import failed
+except Exception as e:
+    log.exception("Failed to initialize Arize Phoenix OpenTelemetry")
+    instrument_fastapi = False
+    instrument_openai = False # Ensure flags are false if init failed
+
+# --- App Creation and Core Imports (Imports happen AFTER instrumentation attempt) ---
 
 from .auth import authenticate_api_key, get_client_identifier, api_key_header
 from . import providers # Import the providers package
-
 
 app = FastAPI(
     title="LLM Gateway",
@@ -31,6 +106,22 @@ app = FastAPI(
     description="API Gateway for LLMs with streaming and observability",
     dependencies=[Depends(api_key_header)]
 )
+
+# Instrument FastAPI App (if possible and enabled)
+# Needs the 'app' object, so must happen after app creation
+if instrument_fastapi:
+    log.debug("Attempting to instrument FastAPI...")
+    try:
+        # Must import here after OTel is configured
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        FastAPIInstrumentor.instrument_app(app)
+        log.info("Explicit FastAPI instrumentation enabled.")
+    except ImportError:
+        log.warning("FastAPIInstrumentor not found, cannot instrument FastAPI.")
+    except Exception as e:
+        log.exception("Failed to instrument FastAPI")
+else:
+    log.warning("FastAPI instrumentation disabled.")
 
 # --- Middleware for request logging and context ---
 @app.middleware("http")
@@ -105,7 +196,7 @@ def secure_endpoint(client_id: str = Depends(get_client_identifier)):
     return {"message": "You have accessed the secure endpoint!"}
 
 
-# --- Provider Router Loading ---
+# --- Provider Router Loading (Imports provider modules) ---
 def include_provider_routers(app: FastAPI):
     """Dynamically load and include routers from the providers package."""
     provider_package = providers

@@ -57,12 +57,23 @@ def setup_logging(log_level: str = "INFO"):
     root_logger.addHandler(handler)
     root_logger.setLevel(log_level_upper)
 
+    # --- Configure Specific Loggers ---
+
     # Silence default Uvicorn access logs if desired, let root handler process them
     logging.getLogger("uvicorn.access").handlers = []
     logging.getLogger("uvicorn.access").propagate = True
 
     # Ensure uvicorn error logs also use our handler
     logging.getLogger("uvicorn.error").propagate = True
+
+    # Set OpenTelemetry log level to DEBUG for troubleshooting
+    # Note: Do this AFTER setting root logger level if root level is higher than DEBUG
+    otel_log_level = logging.DEBUG
+    logging.getLogger("opentelemetry").setLevel(otel_log_level)
+    # You might need to be more specific, e.g., "opentelemetry.sdk", "opentelemetry.exporter"
+    # logging.getLogger("opentelemetry.sdk").setLevel(otel_log_level)
+    # logging.getLogger("opentelemetry.exporter.otlp").setLevel(otel_log_level)
+    print(f"OpenTelemetry logging level set to: {logging.getLevelName(otel_log_level)}")
 
     # Use standard logging for the setup confirmation message itself
     logging.basicConfig(level=log_level_upper)
