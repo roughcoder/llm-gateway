@@ -109,10 +109,11 @@ for url_str in urls_to_check:
 log.info(f"--- Finished Explicit Network Reachability Test. Overall Result: {'ALL PASSED (network-wise)' if all_passed else 'SOME CHECKS FAILED'} ---")
 # NOTE: This test runs synchronously. The code proceeds below only after all checks complete.
 # You can add 'raise ConnectionError("Network checks failed")' here if you want to halt startup on failure.
+phoenix_base_url = os.environ.get("PHOENIX_BASE_URL", "https://phoenix.infinitestack.io")
 
 # --- Explicit API Request Test (Temporary Diagnostic) ---
 log.info("--- Starting Explicit API Request Test (Temporary Diagnostic) ---")
-test_url = 'http://phoenix.infinitestack.io:6006/v1/prompts/system-writer/tags/production'
+test_url = f'{phoenix_base_url}/v1/prompts/system-writer/tags/production'
 test_headers = {
     'accept': 'application/json',
     'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJBcGlLZXk6MyJ9.r0w53eXJj8DGbTnFPICD0BE0nLwc_CI1IHBK1TAV4mk' # NOTE: Hardcoding tokens is generally discouraged
@@ -153,7 +154,6 @@ log.info("--- Finished Explicit API Request Test ---")
 # (This section should ideally use PHOENIX_BASE_URL env var as implemented previously, 
 # but keeping it separate as requested for this temporary test)
 # Read the base URL from environment variable, fallback to default
-phoenix_base_url = os.environ.get("PHOENIX_BASE_URL", "https://phoenix.infinitestack.io")
 log.info(f"Target Phoenix base URL configured as: {phoenix_base_url}")
 
 # --- Import and Initialize Phoenix Client --- 
