@@ -21,10 +21,11 @@ from openinference.instrumentation import using_attributes
 # --- Import Phoenix Client ---
 try:
     from phoenix.client import Client as PhoenixClient
-    # Initialize Phoenix client (consider making this global like the OpenAI client)
-    # For simplicity here, initializing per request, but might be inefficient.
-    # Ensure PHOENIX_COLLECTOR_ENDPOINT is set in env vars for the client.
-    phoenix_client = PhoenixClient(base_url="https://phoenix.infinitestack.io")
+    # Initialize Phoenix client
+    # Read the base URL from environment variable, fallback to default
+    phoenix_base_url = os.environ.get("PHOENIX_BASE_URL", "https://phoenix.infinitestack.io")
+    log.info(f"Initializing PhoenixClient with base_url: {phoenix_base_url}") # Add logging
+    phoenix_client = PhoenixClient(base_url=phoenix_base_url)
     phoenix_available = True
 except ImportError:
     phoenix_client = None
