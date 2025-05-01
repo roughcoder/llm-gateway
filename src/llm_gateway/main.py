@@ -21,14 +21,15 @@ setup_logging(log_level=LOG_LEVEL)
 # Get a logger instance
 log = structlog.get_logger(__name__)
 
-from .auth import authenticate_api_key, get_client_identifier
+from .auth import authenticate_api_key, get_client_identifier, api_key_header
 from . import providers # Import the providers package
 
 
 app = FastAPI(
     title="LLM Gateway",
     version="0.1.0",
-    description="API Gateway for LLMs with streaming and observability"
+    description="API Gateway for LLMs with streaming and observability",
+    dependencies=[Depends(api_key_header)]
 )
 
 # --- Middleware for request logging and context ---
@@ -91,8 +92,12 @@ def health_check():
     return {"status": "OK", "version": app.version}
 
 
-# Example secured endpoint
-@app.get("/secure", tags=["Test"], dependencies=[Depends(authenticate_api_key)])
+# Example secured endpoint - Now explicitly add the security scheme for docs
+@app.get(
+    "/secure",
+    tags=["Test"],
+    dependencies=[Depends(authenticate_api_key)],
+)
 def secure_endpoint(client_id: str = Depends(get_client_identifier)):
     """An example endpoint protected by API key authentication."""
     # Now using the dependency to get the client ID
@@ -132,8 +137,8 @@ def include_provider_routers(app: FastAPI):
                     module.router,
                     prefix=router_prefix,
                     tags=[f"Provider: {provider_name.capitalize()}"],
-                    dependencies=[Depends(authenticate_api_key)] # Auth applied here
-                    # Note: Could add get_client_identifier here too if needed by all provider routes
+                    dependencies=[Depends(authenticate_api_key)] # Runtime check
+                    # The global app dependency on api_key_header helps with docs
                 )
             else:
                 log.warning(f"No APIRouter named 'router' found", module_name=full_module_name)

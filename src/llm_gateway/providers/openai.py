@@ -3,7 +3,8 @@ import httpx
 import logging
 from fastapi import APIRouter, HTTPException, Request, Response, Query
 from fastapi.responses import StreamingResponse
-from typing import Any, Dict, AsyncGenerator
+from typing import Any, Dict, AsyncGenerator, List, Optional
+from pydantic import BaseModel, Field
 
 # Note: Using httpx directly for now, but could switch to openai SDK later
 # from openai import AsyncOpenAI
@@ -33,6 +34,24 @@ def get_openai_client() -> httpx.AsyncClient:
 #         await _async_client.aclose()
 #         _async_client = None
 #         log.info("Closed OpenAI HTTPX client")
+
+# --- Pydantic Models for Request Body ---
+class OpenAIChatMessage(BaseModel):
+    role: str
+    content: str
+
+class OpenAIChatCompletionRequest(BaseModel):
+    model: str
+    messages: List[OpenAIChatMessage]
+    stream: Optional[bool] = False
+    # Add other common OpenAI parameters as needed for validation/docs
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    # ... other params
+
+    # Allow extra fields to pass through to OpenAI
+    class Config:
+        extra = 'allow'
 
 # --- Streaming Generators ---
 async def raw_stream_generator(response: httpx.Response) -> AsyncGenerator[bytes, None]:
@@ -66,9 +85,13 @@ async def sse_stream_generator(response: httpx.Response) -> AsyncGenerator[bytes
         await response.aclose()
 
 # --- Endpoint ---
-@router.post("/chat/completions", status_code=200)
+@router.post("/chat/completions",
+            # No response_model defined as we proxy directly
+            status_code=200,
+            summary="Proxy OpenAI Chat Completions",
+            description="Proxies requests to the OpenAI /v1/chat/completions endpoint.\n\nSupports standard non-streaming, raw chunk streaming (`stream=True`), and Server-Sent Events (`stream=True`, `stream_format=sse`).")
 async def proxy_openai_chat_completions(
-    request: Request,
+    payload: OpenAIChatCompletionRequest, # Use Pydantic model here
     stream_format: str | None = Query(None, description="Specify 'sse' for Server-Sent Events when stream=true. Defaults to raw chunk streaming.")
 ):
     """Proxy requests to the OpenAI Chat Completions endpoint, supporting non-streaming, raw chunk streaming, and SSE."""
@@ -78,29 +101,27 @@ async def proxy_openai_chat_completions(
         log.error("OPENAI_API_KEY not configured")
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
 
-    try:
-        request_payload = await request.json()
-    except Exception as e:
-        log.error(f"Failed to parse request JSON: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    # Convert Pydantic model back to dict for sending to OpenAI
+    # Use exclude_unset=True to only send parameters explicitly set by the client
+    request_payload_dict = payload.model_dump(exclude_unset=True)
 
     headers = {
         "Authorization": f"Bearer {openai_api_key}",
         "Content-Type": "application/json",
     }
 
-    is_streaming_requested = request_payload.get("stream", False)
+    is_streaming_requested = request_payload_dict.get("stream", False)
     url = f"/chat/completions"
 
     try:
         upstream_request = client.build_request(
             method="POST",
             url=url,
-            json=request_payload,
+            json=request_payload_dict, # Send the dict
             headers=headers
         )
 
-        log.debug("Sending request to OpenAI", url=url, method="POST", stream=is_streaming_requested)
+        log.debug("Sending request to OpenAI", url=url, method="POST", stream=is_streaming_requested, payload=request_payload_dict)
         upstream_response = await client.send(upstream_request, stream=is_streaming_requested)
         log.debug("Received response from OpenAI", status_code=upstream_response.status_code)
 
