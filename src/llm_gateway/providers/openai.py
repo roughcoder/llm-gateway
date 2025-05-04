@@ -178,10 +178,16 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
         log.info("Successfully fetched prompt from Phoenix")
 
         # --- Format Prompt ---
+        # Sanitize variables: Replace None values with empty strings
+        sanitized_variables = {
+            k: (v if v is not None else "") for k, v in payload.variables.items()
+        }
+        log.debug("Sanitized variables for prompt formatting", sanitized_vars=sanitized_variables)
+
         # The phoenix prompt object's .format() method should return a dictionary
         # suitable for **kwargs unpacking into the OpenAI client create method.
         # This includes 'messages', 'model', and potentially other params defined in the prompt.
-        formatted_prompt_dict = phoenix_prompt.format(variables=payload.variables)
+        formatted_prompt_dict = phoenix_prompt.format(variables=sanitized_variables) # Use sanitized variables
         log.debug("Formatted prompt dictionary", formatted_dict=formatted_prompt_dict)
 
     except Exception as e: # Catch potential errors from phoenix client (e.g., prompt not found)
