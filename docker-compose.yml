@@ -1,25 +1,10 @@
 version: '3.8'
 
 services:
-  app:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    command: uvicorn llm_gateway.main:app --reload --host 0.0.0.0 --port 8000
-    volumes:
-      - ./src:/app/src
+  redis:
+    image: "redis:alpine"
     ports:
-      - "8000:8000"
-    environment:
-      # Example Environment Variables - Load secrets securely in production
-      - PYTHONUNBUFFERED=1
-      - PYTHONDONTWRITEBYTECODE=1
-      # - VALID_API_KEYS=testkey1,testkey2
-      # - OPENAI_API_KEY=your_openai_api_key
-      # --- Phoenix / OpenTelemetry --- #
-      # - OTEL_SERVICE_NAME=llm-gateway # Service name for traces
-      # - PHOENIX_API_KEY=YOUR_ARIZE_API_KEY # Required to send traces to Arize cloud
-      # - OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 # OTLP endpoint (if not default)
-      # - OTEL_EXPORTER_OTLP_HEADERS=x-phoenix-api-key=YOUR_ARIZE_API_KEY # Alternative auth method
-    # env_file:
-    #   - .env # Uncomment to load from a .env file 
+      - "6379:6379"
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    env_file:
+      - .env 
