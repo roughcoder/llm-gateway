@@ -423,7 +423,26 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
         if redis_client and cache_key and current_model_for_call:
             log.info(f"Streaming to Redis in background for cache key: {cache_key}")
             # Ensure current_model_for_call is valid before passing
-            asyncio.create_task(stream_to_redis(cache_key, openai_sdk_stream_response, current_model_for_call))
+            initial_status_set_event = asyncio.Event() # Create an event
+            asyncio.create_task(stream_to_redis(
+                cache_key,
+                openai_sdk_stream_response,
+                current_model_for_call,
+                initial_status_set_event=initial_status_set_event # Pass the event
+            ))
+
+            # Wait for the background task to set the 'in_progress' status
+            # before trying to stream from Redis. Add a timeout.
+            try:
+                log.debug(f"Waiting for initial_status_set_event for cache key: {cache_key}")
+                await asyncio.wait_for(initial_status_set_event.wait(), timeout=5.0) # 5 second timeout
+                log.debug(f"initial_status_set_event received or timed out for cache key: {cache_key}")
+            except asyncio.TimeoutError:
+                log.error(f"Timeout waiting for initial cache status to be set by stream_to_redis for key: {cache_key}")
+                # If this timeout occurs, stream_from_redis will likely find no status and error out,
+                # or the client will hang if stream_from_redis waits indefinitely without a status.
+                # Raising an HTTP exception here is safer.
+                raise HTTPException(status_code=500, detail="Cache population timed out waiting for initial status.")
 
             # Now, serve the client from Redis as it's being filled
             response_headers = {}
@@ -561,13 +580,23 @@ def generate_cache_key(prompt_name: str, tag: str, variables: Dict[str, Any], mo
     return "chat:" + hashlib.sha256(sorted_key_input).hexdigest()
 
 # --- Redis Streaming Helper Functions ---
-async def stream_to_redis(cache_key: str, stream: AsyncGenerator[ChatCompletionChunk, None], model_name: str, initial_ttl_seconds: int = 1800):
+async def stream_to_redis(cache_key: str, stream: AsyncGenerator[ChatCompletionChunk, None], model_name: str, initial_ttl_seconds: int = 1800, initial_status_set_event: Optional[asyncio.Event] = None):
     """Streams OpenAI content to Redis list and sets status."""
     if redis_client is None:
         log.error("Redis client not available, cannot stream to Redis.")
+        # The caller (proxy_openai_prompt_completions_sdk) should handle the timeout on initial_status_set_event.wait()
         return
 
-    await redis_client.set(f"{cache_key}:status", "in_progress", ex=initial_ttl_seconds) # Set TTL on status
+    try:
+        await redis_client.set(f"{cache_key}:status", "in_progress", ex=initial_ttl_seconds) # Set TTL on status
+        if initial_status_set_event:
+            initial_status_set_event.set() # Signal that the 'in_progress' status has been set
+    except Exception as e:
+        log.error(f"Failed to set initial 'in_progress' status for {cache_key} or signal event: {e}", exc_info=True)
+        # If this fails, the caller waiting on initial_status_set_event will time out.
+        # We should not proceed with the rest of the function.
+        return
+
     # Store metadata (optional, but useful)
     meta_key = f"{cache_key}:meta"
     await redis_client.hmset(meta_key, {"model": model_name, "timestamp": time.time()})
