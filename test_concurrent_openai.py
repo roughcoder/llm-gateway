@@ -33,14 +33,14 @@ HEADERS_STREAM_CACHE = {
 }
 # Variation 2: Non-Streaming, Caching Enabled (Default)
 HEADERS_NON_STREAM_CACHE = {
-        "X-API-Key": "anotherkey",
+    "X-API-Key": "anotherkey",
     "x-llm-stream": "false",
     "Content-Type": "application/json",
     "Accept": "application/json"
 }
 # Variation 3: Streaming, Caching Disabled
 HEADERS_STREAM_NO_CACHE = {
-        "X-API-Key": "anotherkey",
+    "X-API-Key": "anotherkey",
     "x-llm-stream": "true",
     "x-llm-cache": "false",
     "Content-Type": "application/json",
@@ -48,8 +48,7 @@ HEADERS_STREAM_NO_CACHE = {
 }
 # Variation 4: Streaming, Caching Enabled, Force Refresh
 HEADERS_STREAM_CACHE_REFRESH = {
-        "X-API-Key": "anotherkey",
-
+    "X-API-Key": "anotherkey",
     "x-llm-stream": "true",
     "x-clear-cache": "true",
     "Content-Type": "application/json",

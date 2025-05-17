@@ -357,7 +357,7 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
 
             # For streaming requests ('in_progress' or 'done')
             return StreamingResponse(
-                stream_from_redis(cache_key, "sse" if use_streaming else None),
+                stream_from_redis(cache_key, "sse" if use_streaming else None, redis_client_for_stream=effective_redis_client),
                 status_code=200,
                 media_type=media_type,
                 headers=response_headers
@@ -447,7 +447,8 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
                 cache_key,
                 openai_sdk_stream_response,
                 current_model_for_call,
-                initial_status_set_event=initial_status_set_event # Pass the event
+                initial_status_set_event=initial_status_set_event, # Pass the event
+                redis_client_for_stream=effective_redis_client # Pass the effective_redis_client
             ))
 
             # Wait for the background task to set the 'in_progress' status
@@ -485,7 +486,7 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
             if not use_streaming:
                 log.info(f"Original request non-streaming. Aggregating content from Redis for key: {cache_key}")
                 # Aggregate content from the stream_from_redis generator
-                aggregated_content_bytes = [item async for item in stream_from_redis(cache_key, None)] # Use None for raw format from redis
+                aggregated_content_bytes = [item async for item in stream_from_redis(cache_key, None, redis_client_for_stream=effective_redis_client)] # Use None for raw format from redis
                 full_content = b"".join(aggregated_content_bytes).decode('utf-8')
                 
                 # Similar to cache hit non-streaming:
@@ -511,7 +512,7 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
                 log.info(f"Streaming response from Redis (live fill) for key: {cache_key}")
                 stream_format = "sse" if use_streaming else None
                 return StreamingResponse(
-                    stream_from_redis(cache_key, stream_format), # This will poll Redis
+                    stream_from_redis(cache_key, stream_format, redis_client_for_stream=effective_redis_client), # This will poll Redis
                     status_code=200,
                     media_type=media_type,
                     headers=response_headers
