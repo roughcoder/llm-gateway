@@ -74,6 +74,8 @@ except Exception as e:
     redis_client = None # Set to None to indicate failure, handle in endpoint
 # -----------------------------
 
+LOCK_TTL_SECONDS = int(os.environ.get("REDIS_LOCK_TTL_SECONDS", 60)) # Time-to-live for distributed locks
+
 # log = logging.getLogger(__name__) # Original position - REMOVED
 router = APIRouter()
 
@@ -600,86 +602,172 @@ def generate_cache_key(prompt_name: str, tag: str, variables: Dict[str, Any], mo
     return "chat:" + hashlib.sha256(sorted_key_input).hexdigest()
 
 # --- Redis Streaming Helper Functions ---
-async def stream_to_redis(cache_key: str, stream: AsyncGenerator[ChatCompletionChunk, None], model_name: str, initial_ttl_seconds: int = 1800, initial_status_set_event: Optional[asyncio.Event] = None):
-    """Streams OpenAI content to Redis list and sets status."""
-    if redis_client is None:
-        log.error("Redis client not available, cannot stream to Redis.")
-        # The caller (proxy_openai_prompt_completions_sdk) should handle the timeout on initial_status_set_event.wait()
+async def stream_to_redis(
+    cache_key: str,
+    stream: AsyncGenerator[ChatCompletionChunk, None],
+    model_name: str,
+    initial_ttl_seconds: int = 1800,
+    initial_status_set_event: Optional[asyncio.Event] = None,
+    redis_client_for_stream: Optional[aioredis.Redis] = None,
+    lock_key_to_release: Optional[str] = None
+):
+    """Streams OpenAI content to Redis list, sets status, and releases lock."""
+    actual_redis_client = redis_client_for_stream # Use passed client directly
+    if actual_redis_client is None:
+        log.error(f"Redis client not available for stream_to_redis (cache_key: {cache_key}). Cannot stream or release lock {lock_key_to_release}.")
+        # Signal event if provided, so caller doesn't hang indefinitely, though it's an error state.
+        if initial_status_set_event and not initial_status_set_event.is_set():
+            initial_status_set_event.set() # Unblock waiter, but it will likely face an error.
         return
 
+    status_set_successfully = False
     try:
-        await redis_client.set(f"{cache_key}:status", "in_progress", ex=initial_ttl_seconds) # Set TTL on status
+        await actual_redis_client.set(f"{cache_key}:status", "in_progress", ex=initial_ttl_seconds) # Set TTL on status
+        status_set_successfully = True
         if initial_status_set_event:
             initial_status_set_event.set() # Signal that the 'in_progress' status has been set
     except Exception as e:
         log.error(f"Failed to set initial 'in_progress' status for {cache_key} or signal event: {e}", exc_info=True)
-        # If this fails, the caller waiting on initial_status_set_event will time out.
-        # We should not proceed with the rest of the function.
-        return
+        # If this fails, the caller waiting on initial_status_set_event will time out or error.
+        # The lock should still be released in finally.
+        # Ensure event is set to unblock, caller will handle the timeout/error.
+        if initial_status_set_event and not initial_status_set_event.is_set():
+            initial_status_set_event.set()
+        # Do not proceed with streaming if initial status failed.
+        # The 'finally' block will handle lock release.
+        return # Critical to return here to prevent further operations if status not set.
 
     # Store metadata (optional, but useful)
     meta_key = f"{cache_key}:meta"
-    await redis_client.hmset(meta_key, {"model": model_name, "timestamp": time.time()})
-    await redis_client.expire(meta_key, initial_ttl_seconds) # Set TTL on meta
-
-    list_key = cache_key # Use the base cache_key as the list key
     try:
+        await actual_redis_client.hmset(meta_key, {"model": model_name, "timestamp": time.time()})
+        await actual_redis_client.expire(meta_key, initial_ttl_seconds) # Set TTL on meta
+
+        list_key = cache_key # Use the base cache_key as the list key
         async for chunk in stream:
             if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
                 content = chunk.choices[0].delta.content
-                await redis_client.rpush(list_key, content)
+                await actual_redis_client.rpush(list_key, content)
                 # Extend TTL on each chunk received to keep active streams alive
-                await redis_client.expire(list_key, initial_ttl_seconds)
-                await redis_client.expire(f"{cache_key}:status", initial_ttl_seconds)
-                await redis_client.expire(meta_key, initial_ttl_seconds)
-        await redis_client.set(f"{cache_key}:status", "done", ex=initial_ttl_seconds) # Final TTL on done status
+                await actual_redis_client.expire(list_key, initial_ttl_seconds)
+                await actual_redis_client.expire(f"{cache_key}:status", initial_ttl_seconds)
+                await actual_redis_client.expire(meta_key, initial_ttl_seconds)
+        await actual_redis_client.set(f"{cache_key}:status", "done", ex=initial_ttl_seconds) # Final TTL on done status
         log.info(f"Finished streaming to Redis for key: {cache_key}")
     except Exception as e:
         log.error(f"Error streaming to Redis for key {cache_key}: {e}", exc_info=True)
-        await redis_client.set(f"{cache_key}:status", "error", ex=initial_ttl_seconds)
-        # Optionally store error information in meta or another key
+        if status_set_successfully: # Only try to set error status if 'in_progress' was successfully set
+            try:
+                await actual_redis_client.set(f"{cache_key}:status", "error", ex=initial_ttl_seconds)
+            except Exception as e_status:
+                log.error(f"Failed to set 'error' status for {cache_key} after streaming error: {e_status}", exc_info=True)
+        # Ensure event is set if it wasn't, to unblock waiters, even on error.
+        if initial_status_set_event and not initial_status_set_event.is_set():
+            initial_status_set_event.set()
+    finally:
+        if lock_key_to_release and actual_redis_client:
+            try:
+                log.info(f"Releasing lock in stream_to_redis: {lock_key_to_release}")
+                deleted_count = await actual_redis_client.delete(lock_key_to_release)
+                if deleted_count > 0:
+                    log.info(f"Successfully released lock: {lock_key_to_release}")
+                else:
+                    log.warning(f"Attempted to release lock {lock_key_to_release}, but it was not found (possibly expired or released by another process).")
+            except Exception as e_lock_release:
+                log.error(f"Failed to release lock {lock_key_to_release} in stream_to_redis: {e_lock_release}", exc_info=True)
 
-async def stream_from_redis(cache_key: str, stream_format: Optional[str]) -> AsyncGenerator[bytes, None]:
-    """Streams content from Redis list, polling for new items if in_progress."""
-    if redis_client is None:
-        log.error("Redis client not available, cannot stream from Redis.")
-        # This case should ideally be handled before calling this function
-        # or yield an error message to the client
-        yield b"Error: Cache service not available\n"
+async def stream_from_redis(
+    cache_key: str,
+    stream_format: Optional[str],
+    redis_client_for_stream: Optional[aioredis.Redis] = None,
+    max_wait_initial_status_seconds: int = 10 # Max time to wait for initial status to appear
+) -> AsyncGenerator[bytes, None]:
+    """Streams content from Redis list, polling for new items if in_progress. Includes timeout for initial status."""
+    actual_redis_client = redis_client_for_stream # Use passed client directly
+    if actual_redis_client is None:
+        log.error(f"Redis client not available for stream_from_redis (cache_key: {cache_key}).")
+        error_msg = "Error: Cache service not available"
+        if stream_format == "sse":
+            yield f"data: {json.dumps({'error': error_msg})}\n\n".encode('utf-8')
+        else:
+            yield error_msg.encode('utf-8')
         return
 
     list_key = cache_key
     current_index = 0
-    while True:
-        # Check status first
-        status = await redis_client.get(f"{cache_key}:status")
+    wait_time_for_initial_status = 0.0
+    initial_status_poll = True
 
-        # Retrieve available chunks
-        # Use lrange to get all new chunks since last poll
-        new_chunks = await redis_client.lrange(list_key, current_index, -1)
-        for chunk_content in new_chunks:
-            if chunk_content: # Ensure content is not None
+    while True:
+        status = None
+        try:
+            status = await actual_redis_client.get(f"{cache_key}:status")
+        except Exception as e:
+            log.error(f"Error getting cache status for {cache_key} from Redis: {e}", exc_info=True)
+            error_payload = json.dumps({"error": "Error accessing cache status."})
+            if stream_format == "sse": yield f"data: {error_payload}\n\n".encode('utf-8')
+            else: yield error_payload.encode('utf-8')
+            break
+
+        if initial_status_poll and status is None:
+            if wait_time_for_initial_status >= max_wait_initial_status_seconds:
+                log.error(f"Timeout waiting for initial cache status for {cache_key} (waited {wait_time_for_initial_status:.1f}s). Status remains None.")
+                error_payload = json.dumps({"error": "Timeout waiting for response generation to start."})
+                if stream_format == "sse": yield f"data: {error_payload}\n\n".encode('utf-8')
+                else: yield error_payload.encode('utf-8')
+                break
+            await asyncio.sleep(0.1) # Polling interval
+            wait_time_for_initial_status += 0.1
+            continue # Retry getting status
+        elif status is not None: # Status appeared or was already there
+            initial_status_poll = False
+
+
+        new_chunks = []
+        try:
+            # Retrieve available chunks
+            # Use lrange to get all new chunks since last poll
+            new_chunks = await actual_redis_client.lrange(list_key, current_index, -1)
+        except Exception as e:
+            log.error(f"Error getting chunks from Redis list {list_key}: {e}", exc_info=True)
+            error_payload = json.dumps({"error": "Error accessing cached content."})
+            if stream_format == "sse": yield f"data: {error_payload}\n\n".encode('utf-8')
+            else: yield error_payload.encode('utf-8')
+            break
+
+        for chunk_content_str in new_chunks:
+            if chunk_content_str is not None: # Ensure content is not None (Redis returns strings)
+                # Construct a pseudo ChatCompletionChunk if SSE, otherwise raw content
                 if stream_format == "sse":
-                    # For SSE, we need to reconstruct a pseudo-chunk or send raw content with SSE envelope
-                    # For simplicity, sending raw content as SSE data. A more robust solution
-                    # might store the full JSON chunk if SSE format is always needed from cache.
-                    # Here, we assume the client can handle raw content strings for SSE data payload.
-                    sse_event = f"data: {json.dumps({'delta': {'content': chunk_content}})}\n\n"
+                    # For SSE, reconstruct a more complete delta if possible,
+                    # or ensure the client handles simple content updates.
+                    # The current approach sends content as if it's chunk.choices[0].delta.content
+                    sse_data = {
+                        # "id": f"sse-cached-{cache_key}-{current_index}", # Optional: add an ID
+                        # "object": "chat.completion.chunk",
+                        # "created": int(time.time()),
+                        # "model": "cached_model", # This would require fetching from :meta if needed per chunk
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"role": "assistant", "content": chunk_content_str},
+                            # "finish_reason": None # Typically None until the end
+                        }]
+                    }
+                    sse_event = f"data: {json.dumps(sse_data)}\n\n"
                     yield sse_event.encode('utf-8')
                 else:
-                    yield chunk_content.encode('utf-8') # For raw streaming
+                    yield chunk_content_str.encode('utf-8') # For raw streaming
             current_index += 1 # Increment based on number of chunks processed
 
         if status == "done":
             log.info(f"Finished streaming from Redis (done) for key: {cache_key}")
-            # Optionally send SSE [DONE] message if format is sse
+            # Optionally send SSE [DONE] message if format is sse and client expects it
             # if stream_format == "sse":
-            #     yield b"data: [DONE]\n\n"
+            #     yield b"data: [DONE]\n\n" # OpenAI SDK compatible [DONE] is more complex
             break
         elif status == "error":
-            log.error(f"Error status encountered for cache key: {cache_key}. Stopping stream.")
-            # Yield an error message to the client
-            error_payload = json.dumps({"error": "An error occurred while generating the response."})
+            log.error(f"Error status encountered for cache key: {cache_key} while streaming from Redis. Stopping stream.")
+            error_payload = json.dumps({"error": "An error occurred during response generation."})
             if stream_format == "sse":
                 yield f"data: {error_payload}\n\n".encode('utf-8')
             else:
@@ -689,16 +777,20 @@ async def stream_from_redis(cache_key: str, stream_format: Optional[str]) -> Asy
             # If no new chunks and still in_progress, wait a bit
             if not new_chunks:
                 await asyncio.sleep(0.1) # Polling interval
-        elif status is None:
-            log.warning(f"Cache key {cache_key} status disappeared or expired mid-stream.")
-            # This case means the cache entry (or its status) expired or was deleted unexpectedly
-            # Treat as an error or an incomplete stream
+        elif status is None and not initial_status_poll : # Status disappeared after appearing
+            log.warning(f"Cache key {cache_key} status disappeared or expired mid-stream (after initial appearance).")
             error_payload = json.dumps({"error": "Stream interrupted or cache expired."})
             if stream_format == "sse":
                 yield f"data: {error_payload}\n\n".encode('utf-8')
             else:
                 yield error_payload.encode('utf-8')
             break
+        elif status is None: # Should have been caught by initial_status_poll timeout
+            log.error(f"Cache key {cache_key} status is None unexpectedly. This should have been caught by timeout.")
+            break
         else: # Should not happen if status is only 'in_progress', 'done', 'error'
-            log.warning(f"Unknown status '{status}' for cache key: {cache_key}")
+            log.warning(f"Unknown status '{status}' for cache key: {cache_key}. Stopping stream.")
+            error_payload = json.dumps({"error": f"Unknown stream status: {status}"})
+            if stream_format == "sse": yield f"data: {error_payload}\n\n".encode('utf-8')
+            else: yield error_payload.encode('utf-8')
             break 
