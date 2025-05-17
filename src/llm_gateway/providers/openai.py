@@ -112,10 +112,8 @@ class OpenAIPromptCompletionRequest(BaseModel):
     # Core OpenAI fields (model comes from prompt, but can be overridden)
     model: Optional[str] = None # Model can now be optional, fetched from prompt or overridden
     variables: Dict[str, Any] = Field(..., description="Dictionary of variables to fill the prompt template.")
-    stream: Optional[bool] = False
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
-    force_refresh: Optional[bool] = Field(False, description="Force a cache refresh, ignoring any existing cached response.")
 
     # --- Context fields for Tracing ---
     session_id: Optional[str] = Field(None, description="Session ID for grouping related traces.")
@@ -165,15 +163,56 @@ async def sdk_sse_stream_generator(stream: AsyncGenerator[ChatCompletionChunk, N
 @router.post("/{prompt_name}/{tag}",
             status_code=200,
             summary="Proxy OpenAI Chat Completions using a dynamic Phoenix Prompt",
-            description="Fetches a prompt template from Arize Phoenix by name and tag, formats it with variables, and calls OpenAI /v1/chat/completions using the SDK.\\n\\nSupports standard non-streaming, raw chunk streaming (`stream=True`), and Server-Sent Events (`stream=True`, `stream_format=sse`). Tracing is automatically handled by OpenInference instrumentation.")
+            description="""
+            Fetches a prompt template from Arize Phoenix by name and tag, formats it with variables, and calls OpenAI's chat completions API using the SDK.
+            
+            ## Headers
+            
+            - **x-llm-stream**: (optional, default: false) Controls streaming mode. Set to "true" to enable Server-Sent Events streaming.
+            - **x-llm-cache**: (optional, default: true) Controls caching. Set to "false" to bypass the cache completely.
+            - **x-clear-cache**: (optional, default: false) Set to "true" to force refresh the cache for this request.
+            
+            ## Request Body
+            
+            - **model**: (optional) Override the model specified in the Phoenix prompt.
+            - **variables**: (required) Dictionary of variables to fill in the prompt template.
+            - **temperature**: (optional) Control the randomness of the response.
+            - **max_tokens**: (optional) Limit the maximum number of tokens in the response.
+            - **session_id**, **user_id**, **metadata**, **tags**: (optional) Fields for tracing and grouping requests.
+            
+            Additional OpenAI parameters like functions, tools, etc. are also supported.
+            
+            ## Response
+            
+            - If **x-llm-stream** is "true": Returns a Server-Sent Events stream with incremental response chunks.
+            - If **x-llm-stream** is "false": Returns a standard JSON response with the complete response.
+            """)
 async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
     prompt_name: str,
     tag: str,
     payload: OpenAIPromptCompletionRequest, # Use the new request model
     request: Request, # Add Request to access headers
-    stream_format: str | None = Query(None, description="Specify 'sse' for Server-Sent Events when stream=true. Defaults to raw chunk streaming if stream=true.")
 ):
-    """Fetches a prompt from Phoenix, formats it, and calls OpenAI Chat Completions, with Redis caching."""
+    """
+    Dynamic prompt endpoint that retrieves a prompt from Phoenix, formats it with variables, and sends it to OpenAI.
+    
+    Path Parameters:
+    - **prompt_name**: The name of the prompt template in Phoenix
+    - **tag**: The tag of the prompt template version to use
+    
+    Headers:
+    - **x-llm-stream**: Set to "true" to enable streaming (default: "false")
+    - **x-llm-cache**: Set to "false" to disable caching (default: "true")
+    - **x-clear-cache**: Set to "true" to invalidate and refresh the cache (default: "false")
+    
+    The endpoint supports both streaming and non-streaming responses, and includes
+    automatic caching for improved performance and reduced API costs.
+    """
+    # Extract header values with defaults
+    use_streaming = request.headers.get("x-llm-stream", "false").lower() == "true"
+    use_caching = request.headers.get("x-llm-cache", "true").lower() == "true"
+    force_refresh = request.headers.get("x-clear-cache", "false").lower() == "true"
+    
     # Check if OpenAI client initialization failed during import
     if client is None:
          log.error("OpenAI client was not initialized.")
@@ -185,23 +224,18 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
         raise HTTPException(status_code=501, detail="Dynamic prompt functionality is not available.")
 
     # --- Check Redis Client Availability ---
-    if redis_client is None:
-        log.warning("Redis client not available. Proceeding without cache.")
-        # Fallback to direct OpenAI call if Redis is down (or choose to error out)
-        # For this implementation, we'll proceed without caching if Redis isn't up.
-        # A production system might want to error or have a more robust fallback.
-
+    # If caching is disabled via header, set redis_client to None for this request
+    effective_redis_client = None if not use_caching else redis_client
+    
+    if redis_client is None and use_caching:
+        log.warning("Redis client not available but caching was requested. Proceeding without cache.")
+    elif not use_caching:
+        log.info("Caching disabled by x-llm-cache header")
+    
     # --- Prepare Payload for OpenAI SDK (potentially used for cache key and direct call) ---
     # Start with an empty dict for sdk_payload_dict, it will be populated after Phoenix call
     # or from cache key parameters if model is not in Phoenix.
     sdk_payload_dict_for_key = {}
-
-    # Override/add parameters from the request payload if provided for cache key generation
-    # Model is crucial for the cache key. If payload.model is present, use it.
-    # If not, we'll try to get it from Phoenix prompt later.
-    # This means cache key generation might be slightly deferred or need re-evaluation
-    # if the model comes *only* from Phoenix. For now, assume we use payload.model if present,
-    # or a default/placeholder if not, then refine.
 
     # For cache key, we need a definitive model.
     # If payload.model is set, use that.
@@ -241,7 +275,7 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
 
     # --- Generate Cache Key ---
     cache_key = ""
-    if redis_client: # Only generate if redis is available
+    if effective_redis_client: # Only generate if redis is available and caching is enabled
         # Ensure key_model is available before generating cache key
         if not key_model:
              log.error("Model not found in Phoenix prompt or payload for cache key generation.")
@@ -260,27 +294,24 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
             log.info(f"Generated cache key: {cache_key}")
 
             # --- Cache Invalidation ---
-            force_refresh = payload.model_dump().get("force_refresh") or request.headers.get("x-clear-cache") == "true"
             if force_refresh:
                 log.info(f"Force refresh requested for cache key: {cache_key}. Deleting cache.")
-                await redis_client.delete(cache_key) # Deletes the list
-                await redis_client.delete(f"{cache_key}:status")
-                await redis_client.delete(f"{cache_key}:meta")
+                await effective_redis_client.delete(cache_key) # Deletes the list
+                await effective_redis_client.delete(f"{cache_key}:status")
+                await effective_redis_client.delete(f"{cache_key}:meta")
                 # Any other related keys should also be deleted here.
 
     # --- Check Cache (if Redis is available and cache_key was generated) ---
-    if redis_client and cache_key:
-        cache_status = await redis_client.get(f"{cache_key}:status")
+    if effective_redis_client and cache_key:
+        cache_status = await effective_redis_client.get(f"{cache_key}:status")
         log.info(f"Cache status for key {cache_key}: {cache_status}")
 
-        is_streaming_requested_for_cache_check = payload.stream is not False # True if stream=True or stream=None (defaults to streaming)
-
-        if cache_status == "done" or (cache_status == "in_progress" and is_streaming_requested_for_cache_check):
+        if cache_status == "done" or (cache_status == "in_progress" and use_streaming):
             log.info(f"Serving from cache for key: {cache_key}, status: {cache_status}")
             response_headers = {}
-            media_type = "text/plain" # Default for raw stream from cache
-            if stream_format == "sse":
-                media_type = "text/event-stream" # SSE specific
+            media_type = "text/event-stream" if use_streaming else "application/json"
+            
+            if use_streaming:
                 response_headers = {
                     "Content-Type": "text/event-stream",
                     "Cache-Control": "no-cache",
@@ -289,20 +320,16 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
                 }
             
             # For non-streaming requests that hit a 'done' cache:
-            if not is_streaming_requested_for_cache_check and cache_status == "done":
+            if not use_streaming and cache_status == "done":
                 # We need to aggregate the cached content.
                 # This is a simplification; a full ChatCompletion object might be expected.
                 # For now, we'll return concatenated content.
                 # A more robust solution would store/reconstruct the full ChatCompletion object.
                 log.info(f"Aggregating cached content for non-streaming request for key: {cache_key}")
-                all_content_parts = await redis_client.lrange(cache_key, 0, -1)
+                all_content_parts = await effective_redis_client.lrange(cache_key, 0, -1)
                 full_content = "".join(all_content_parts)
                 
                 # Create a pseudo ChatCompletion object or a simple JSON response
-                # This part needs to align with what the client expects for a non-streamed cached response.
-                # Here, returning a simple JSON structure.
-                # Ideally, store and retrieve the original non-streaming JSON response if caching those.
-                # If only content chunks are stored, this is the best we can do without more complex reconstruction.
                 cached_response_model = formatted_prompt_dict.get('model', key_model) # Get model used
                 pseudo_completion = {
                     "id": f"cached-{cache_key}",
@@ -323,15 +350,12 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
                         "total_tokens": None # Placeholder
                     }
                 }
-                # Check if system_fingerprint needs to be included based on OpenAI version/response
-                # if client. Completions.with_raw_response.create(...) was used originally, this would be available
-                # pseudo_completion["system_fingerprint"] = await redis_client.hget(f"{cache_key}:meta", "system_fingerprint")
                 
                 return pseudo_completion # FastAPI will convert dict to JSONResponse
 
             # For streaming requests ('in_progress' or 'done')
             return StreamingResponse(
-                stream_from_redis(cache_key, stream_format),
+                stream_from_redis(cache_key, "sse" if use_streaming else None),
                 status_code=200,
                 media_type=media_type,
                 headers=response_headers
@@ -357,22 +381,13 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
     # Add other standard OpenAI parameters
     if payload.temperature is not None: sdk_payload_dict['temperature'] = payload.temperature
     if payload.max_tokens is not None: sdk_payload_dict['max_tokens'] = payload.max_tokens
-    # Stream parameter is crucial for how OpenAI SDK behaves and how we cache
-    # Default to stream=False if not specified, but our logic assumes payload.stream could be None
-    # The cache key generation used payload.stream, so this should be consistent.
-    # sdk_payload_dict['stream'] will be set based on payload.stream or its default (False if not in payload)
-    # However, for caching, we usually *always* stream from OpenAI to populate cache,
-    # then decide how to serve to client (stream or aggregate).
-    # For simplicity here, we'll honor payload.stream for the OpenAI call.
-    # A more advanced caching strategy might always stream from OpenAI.
-
-    original_request_stream_setting = payload.stream if payload.stream is not None else False
-    sdk_payload_dict['stream'] = original_request_stream_setting # Honor client's stream preference for OpenAI call initially
-                                                              # This might be adjusted if we decide to always stream to cache
+    
+    # Set stream parameter based on x-llm-stream header
+    sdk_payload_dict['stream'] = use_streaming
 
     # Add any extra allowed fields
     exclude_keys = {'variables', 'session_id', 'user_id', 'metadata', 'tags', 
-                    'model', 'temperature', 'max_tokens', 'stream', 'force_refresh'} # Add force_refresh
+                    'model', 'temperature', 'max_tokens'}
     extra_params = payload.model_dump(exclude_unset=True, exclude=exclude_keys)
     sdk_payload_dict.update(extra_params)
     
@@ -394,8 +409,10 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
         "llm.prompt_template.variables": payload.variables,
         "llm.request.model": current_model_for_call,
         "llm.cache.hit": False, # Explicitly set cache hit to false for this path
+        "llm.cache.enabled": use_caching, # Add cache enabled attribute
+        "llm.stream.enabled": use_streaming, # Add stream enabled attribute
     }
-    if redis_client and cache_key: # Add cache key if available
+    if effective_redis_client and cache_key: # Add cache key if available
         manual_span_attributes["llm.cache.key"] = cache_key
 
     filtered_manual_attributes = {k: v for k, v in manual_span_attributes.items() if v is not None}
@@ -403,7 +420,7 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
     # Determine if the *actual* call to OpenAI needs to be streaming.
     # For caching, we *always* want to stream the response from OpenAI
     # to populate the Redis list chunk by chunk.
-    # The client's stream preference (original_request_stream_setting)
+    # The client's stream preference (use_streaming)
     # determines if they get a StreamingResponse or an aggregated one.
     sdk_payload_dict_for_openai_call = sdk_payload_dict.copy()
     sdk_payload_dict_for_openai_call['stream'] = True # Always stream from OpenAI for caching
@@ -420,7 +437,7 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
 
         # If Redis is available, start background task to stream to Redis
         # and then serve from Redis (even for the first requester)
-        if redis_client and cache_key and current_model_for_call:
+        if effective_redis_client and cache_key and current_model_for_call:
             log.info(f"Streaming to Redis in background for cache key: {cache_key}")
             # Ensure current_model_for_call is valid before passing
             initial_status_set_event = asyncio.Event() # Create an event
@@ -446,8 +463,8 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
 
             # Now, serve the client from Redis as it's being filled
             response_headers = {}
-            media_type = "text/plain"
-            if stream_format == "sse":
+            media_type = "application/json"
+            if use_streaming:
                 media_type = "text/event-stream"
                 response_headers = {
                     "Content-Type": "text/event-stream",
@@ -461,9 +478,9 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
             # For simplicity, if original request was not streaming, we'd ideally wait for stream_to_redis to finish,
             # then retrieve all from Redis.
             # However, stream_from_redis already handles polling until "done".
-            # So, if original_request_stream_setting is False, we need to aggregate the output of stream_from_redis.
+            # So, if use_streaming is False, we need to aggregate the output of stream_from_redis.
 
-            if not original_request_stream_setting:
+            if not use_streaming:
                 log.info(f"Original request non-streaming. Aggregating content from Redis for key: {cache_key}")
                 # Aggregate content from the stream_from_redis generator
                 aggregated_content_bytes = [item async for item in stream_from_redis(cache_key, None)] # Use None for raw format from redis
@@ -489,7 +506,8 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
                 return pseudo_completion
             else:
                 # Original request was for streaming, serve from Redis as it fills
-                log.info(f"Streaming response from Redis (live fill) for key: {cache_key}, format: {stream_format}")
+                log.info(f"Streaming response from Redis (live fill) for key: {cache_key}")
+                stream_format = "sse" if use_streaming else None
                 return StreamingResponse(
                     stream_from_redis(cache_key, stream_format), # This will poll Redis
                     status_code=200,
@@ -498,46 +516,48 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
                 )
         else:
             # Redis not available or issue with cache_key/model, fallback to direct OpenAI handling (original behavior)
-            # This means if redis_client is None, we hit this path.
+            # This means if effective_redis_client is None, we hit this path.
             log.warning("Redis not available or cache_key/model invalid. Fallback to direct OpenAI call without caching.")
-            # Reset to original stream setting if we forced it to True for caching attempt
-            sdk_payload_dict['stream'] = original_request_stream_setting
+            # Set stream setting based on x-llm-stream header for direct call
+            sdk_payload_dict['stream'] = use_streaming
             
             # Re-call OpenAI with original stream setting if we are not caching
-            # (This is inefficient as we might have already called with stream=True if redis_client was initially True then failed)
+            # (This is inefficient as we might have already called with stream=True if effective_redis_client was initially True then failed)
             # A better refactor would be to decide ONCE if we cache, then make ONE call.
-            # For now, let's assume if redis_client is None from the start, we make one call.
+            # For now, let's assume if effective_redis_client is None from the start, we make one call.
             # If it became None mid-logic, this is suboptimal.
 
-            # If we are in this 'else' because redis_client was None from the start,
+            # If we are in this 'else' because effective_redis_client was None from the start,
             # we need to make the OpenAI call here.
-            # If we are here because cache_key or current_model_for_call was None, but redis_client is active,
-            # it's an issue. The logic assumes cache_key and current_model_for_call are valid if redis_client is.
+            # If we are here because cache_key or current_model_for_call was None, but effective_redis_client is active,
+            # it's an issue. The logic assumes cache_key and current_model_for_call are valid if effective_redis_client is.
 
-            # Let's refine: if redis_client IS available, but cache_key/model was bad, that's an error state for caching.
-            # If redis_client is NOT available, we simply pass through to OpenAI.
+            # Let's refine: if effective_redis_client IS available, but cache_key/model was bad, that's an error state for caching.
+            # If effective_redis_client is NOT available, we simply pass through to OpenAI.
 
-            # If we got here because redis_client is None:
-            if not redis_client:
-                log.info("Performing direct OpenAI call as Redis is not available.")
-                # Ensure payload for direct call uses original stream setting
+            # If we got here because effective_redis_client is None:
+            if not effective_redis_client:
+                log.info("Performing direct OpenAI call as Redis is not available or caching is disabled.")
+                # Ensure payload for direct call uses stream setting based on x-llm-stream header
                 sdk_payload_dict_direct_call = sdk_payload_dict.copy()
-                sdk_payload_dict_direct_call['stream'] = original_request_stream_setting
+                sdk_payload_dict_direct_call['stream'] = use_streaming
 
                 direct_response = await client.chat.completions.create(**sdk_payload_dict_direct_call)
 
-                if original_request_stream_setting:
-                    if stream_format == "sse":
-                        log.info("Streaming response as SSE (direct from OpenAI, no cache)")
-                        return StreamingResponse(sdk_sse_stream_generator(direct_response), status_code=200, media_type="text/event-stream", headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"})
-                    else:
-                        log.info("Streaming response as raw chunks (direct from OpenAI, no cache)")
-                        return StreamingResponse(sdk_content_stream_generator(direct_response), status_code=200, media_type="text/plain")
+                if use_streaming:
+                    log.info("Streaming response as SSE (direct from OpenAI, no cache)")
+                    return StreamingResponse(sdk_sse_stream_generator(direct_response), 
+                                             status_code=200, 
+                                             media_type="text/event-stream", 
+                                             headers={"Content-Type": "text/event-stream", 
+                                                     "Cache-Control": "no-cache", 
+                                                     "X-Accel-Buffering": "no", 
+                                                     "Connection": "keep-alive"})
                 else:
                     log.info("Returning non-streaming response (direct from OpenAI, no cache)")
                     return direct_response # This is a ChatCompletion object
             else:
-                # This case implies redis_client is available, but cache_key or model was missing for the caching path.
+                # This case implies effective_redis_client is available, but cache_key or model was missing for the caching path.
                 # This should ideally be prevented by earlier checks.
                 log.error("Reached unexpected state: Redis available but caching path not taken due to missing key/model.")
                 raise HTTPException(status_code=500, detail="Internal error in caching logic.")
@@ -545,9 +565,9 @@ async def proxy_openai_prompt_completions_sdk( # Rename function for clarity
 
     except openai.APIStatusError as e:
         log.warning("OpenAI API returned an error", status_code=e.status_code, error=str(e))
-        if redis_client and cache_key and sdk_payload_dict_for_openai_call.get('stream'): # Check if it was a streaming call for cache
+        if effective_redis_client and cache_key and sdk_payload_dict_for_openai_call.get('stream'): # Check if it was a streaming call for cache
             # If the call to OpenAI failed during streaming to cache, mark cache as error
-            await redis_client.set(f"{cache_key}:status", "error", ex=1800) # ex is TTL in seconds
+            await effective_redis_client.set(f"{cache_key}:status", "error", ex=1800) # ex is TTL in seconds
         raise HTTPException(status_code=e.status_code, detail=str(e))
     except openai.APIConnectionError as e:
         log.error(f"OpenAI SDK failed to connect: {e}", exc_info=True)
